@@ -1,60 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= CONFIG =========
+AUTO_ROLLBACK="${AUTO_ROLLBACK:-0}"   # 1 = rollback nếu verify fail
+
 AUDIT_DIR="/etc/kubernetes/audit"
 POLICY_FILE="${AUDIT_DIR}/audit-policy.yaml"
-
 AUDIT_LOG_DIR="/var/log/kubernetes/audit"
 AUDIT_LOG_FILE="${AUDIT_LOG_DIR}/audit.log"
-
 APISERVER_MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
 
-# kube-apiserver audit rotation flags (theo docs)
-MAXAGE="30"
-MAXBACKUP="10"
-MAXSIZE="100"  # MB
+MAXAGE="30"; MAXBACKUP="10"; MAXSIZE="100"
+WAIT_SEC="240"; SLEEP_STEP="3"; READY_STREAK_REQUIRED="3"
+TEST_WAIT_AFTER_EVENTS="6"
+GREP_LINES="5000"
 
-# timeout chờ apiserver ready sau khi restart
-WAIT_SEC="180"
-SLEEP_STEP="3"
+die(){ echo "ERROR: $*" >&2; exit 1; }
+readyz_ok(){ curl -sk --max-time 2 https://127.0.0.1:6443/readyz >/dev/null 2>&1; }
 
-# ========= PRECHECK =========
-if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: run as root (sudo)." >&2
-  exit 1
-fi
+get_apiserver_cid() {
+  crictl ps -a --name kube-apiserver -q 2>/dev/null | head -n1 || true
+}
 
-if [[ ! -f "${APISERVER_MANIFEST}" ]]; then
-  echo "ERROR: ${APISERVER_MANIFEST} not found. Script này giả định kubeadm static pod." >&2
-  exit 1
-fi
+debug_dump() {
+  echo "===== DEBUG: apiserver flags in manifest ====="
+  grep -nE -- '--audit-policy-file=|--audit-log-path=|--audit-log-maxage=|--audit-log-maxbackup=|--audit-log-maxsize=' \
+    "$APISERVER_MANIFEST" || true
 
-# deps: python3 + PyYAML để sửa YAML đúng cấu trúc
+  echo "===== DEBUG: file permissions ====="
+  ls -ld "$AUDIT_DIR" "$AUDIT_LOG_DIR" || true
+  ls -l "$POLICY_FILE" "$AUDIT_LOG_FILE" || true
+
+  echo "===== DEBUG: last apiserver logs ====="
+  cid="$(get_apiserver_cid)"
+  echo "CID=$cid"
+  if [[ -n "${cid:-}" ]]; then
+    crictl logs "$cid" 2>/dev/null | tail -n 200 || true
+  fi
+
+  echo "===== DEBUG: audit.log tail ====="
+  tail -n 50 "$AUDIT_LOG_FILE" || true
+}
+
+rollback() {
+  local backup="$1"
+  echo "Rollback -> $backup"
+  cp -a "$backup" "$APISERVER_MANIFEST"
+  sleep 15
+}
+
+[[ $EUID -eq 0 ]] || die "Run as root (sudo)."
+[[ -f "$APISERVER_MANIFEST" ]] || die "Missing $APISERVER_MANIFEST (kubeadm static pod expected)."
+command -v kubectl >/dev/null 2>&1 || die "kubectl not found."
+
 if ! command -v python3 >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y python3
+  apt-get update -y && apt-get install -y python3
 fi
 if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  apt-get update -y
-  apt-get install -y python3-yaml
+  apt-get update -y && apt-get install -y python3-yaml
 fi
 
-# ========= SETUP FILES =========
-echo "[1/9] Create audit directories"
-mkdir -p "${AUDIT_DIR}" "${AUDIT_LOG_DIR}"
-chmod 700 "${AUDIT_DIR}" "${AUDIT_LOG_DIR}"
+echo "[1/10] Create directories"
+mkdir -p "$AUDIT_DIR" "$AUDIT_LOG_DIR"
+chmod 700 "$AUDIT_DIR" "$AUDIT_LOG_DIR"
 
-echo "[2/9] Create audit policy ${POLICY_FILE}"
-# Policy production-friendly hơn: bỏ RequestReceived để giảm noise, log write ở RequestResponse,
-# read chỉ Metadata; bỏ healthz/readyz/metrics [web:1]
-cat > "${POLICY_FILE}" <<'YAML'
+echo "[2/10] Write audit policy"
+cat > "$POLICY_FILE" <<'YAML'
 apiVersion: audit.k8s.io/v1
 kind: Policy
-
 omitStages:
   - "RequestReceived"
-
 rules:
   - level: None
     nonResourceURLs:
@@ -65,49 +79,40 @@ rules:
       - /version
       - /swagger*
       - /openapi*
-
-  # Reads: keep metadata
   - level: Metadata
     verbs: ["get","list","watch"]
-
-  # Writes: keep request+response
   - level: RequestResponse
     verbs: ["create","update","patch","delete","deletecollection"]
 YAML
-chmod 600 "${POLICY_FILE}"
+chmod 600 "$POLICY_FILE"
 
-echo "[3/9] Ensure audit log file exists ${AUDIT_LOG_FILE}"
-touch "${AUDIT_LOG_FILE}"
-chmod 600 "${AUDIT_LOG_FILE}"
+echo "[3/10] Prepare audit log path"
+touch "$AUDIT_LOG_FILE"
+chmod 600 "$AUDIT_LOG_FILE"
 
-echo "[4/9] Backup kube-apiserver manifest"
+echo "[4/10] Backup kube-apiserver manifest"
 BACKUP="${APISERVER_MANIFEST}.bak.$(date +%Y%m%d%H%M%S)"
-cp -a "${APISERVER_MANIFEST}" "${BACKUP}"
-echo "Backup saved: ${BACKUP}"
+cp -a "$APISERVER_MANIFEST" "$BACKUP"
+echo "Backup: $BACKUP"
 
-# ========= PATCH kube-apiserver static pod =========
-echo "[5/9] Patch ${APISERVER_MANIFEST} (flags + volumeMounts + volumes)"
+echo "[5/10] Patch apiserver manifest"
 python3 - <<PY
 import yaml
-
 m_path="${APISERVER_MANIFEST}"
 policy="${POLICY_FILE}"
 log_dir="${AUDIT_LOG_DIR}"
 log_file="${AUDIT_LOG_FILE}"
-maxage="${MAXAGE}"
-maxbackup="${MAXBACKUP}"
-maxsize="${MAXSIZE}"
+maxage="${MAXAGE}"; maxbackup="${MAXBACKUP}"; maxsize="${MAXSIZE}"
 
 doc=yaml.safe_load(open(m_path))
 c=doc["spec"]["containers"][0]
-cmd=c.get("command", [])
+cmd=c.get("command",[])
 
-def setflag(prefix, val):
+def setflag(prefix,val):
     out=[x for x in cmd if not x.startswith(prefix)]
     out.append(f"{prefix}{val}")
     return out
 
-# Bật audit backend đúng chuẩn flags [web:1]
 cmd=setflag("--audit-policy-file=", policy)
 cmd=setflag("--audit-log-path=", log_file)
 cmd=setflag("--audit-log-maxage=", maxage)
@@ -115,72 +120,62 @@ cmd=setflag("--audit-log-maxbackup=", maxbackup)
 cmd=setflag("--audit-log-maxsize=", maxsize)
 c["command"]=cmd
 
-vms=c.get("volumeMounts", [])
-def ensure_vm(name, mountPath, readOnly):
+vms=c.get("volumeMounts",[])
+def ensure_vm(name,path,ro):
     for vm in vms:
         if vm.get("name")==name:
-            vm["mountPath"]=mountPath
-            vm["readOnly"]=bool(readOnly)
-            return
-    vms.append({"name":name, "mountPath":mountPath, "readOnly":bool(readOnly)})
+            vm["mountPath"]=path; vm["readOnly"]=bool(ro); return
+    vms.append({"name":name,"mountPath":path,"readOnly":bool(ro)})
 
-# Nếu apiserver chạy dạng Pod, cần hostPath mount policy/log để persist [web:1]
 ensure_vm("audit-policy", policy, True)
 ensure_vm("audit-logs", log_dir, False)
 c["volumeMounts"]=vms
 
-vols=doc["spec"].get("volumes", [])
-def ensure_vol(name, hostPath, type_):
+vols=doc["spec"].get("volumes",[])
+def ensure_vol(name,path,type_):
     for v in vols:
         if v.get("name")==name:
-            v["hostPath"]={"path":hostPath, "type":type_}
-            return
-    vols.append({"name":name, "hostPath":{"path":hostPath, "type":type_}})
+            v["hostPath"]={"path":path,"type":type_}; return
+    vols.append({"name":name,"hostPath":{"path":path,"type":type_}})
 
 ensure_vol("audit-policy", policy, "File")
 ensure_vol("audit-logs", log_dir, "DirectoryOrCreate")
 doc["spec"]["volumes"]=vols
 
-yaml.safe_dump(doc, open(m_path, "w"), default_flow_style=False, sort_keys=False)
+yaml.safe_dump(doc, open(m_path,"w"), default_flow_style=False, sort_keys=False)
 PY
 
-# ========= WAIT apiserver =========
-echo "[6/9] Wait for apiserver ready (kubelet will restart static pod)"
+echo "[6/10] Wait apiserver ready (stable)"
 deadline=$((SECONDS+WAIT_SEC))
+streak=0
 while [[ $SECONDS -lt $deadline ]]; do
-  if curl -sk https://127.0.0.1:6443/readyz >/dev/null 2>&1; then
-    echo "apiserver ready"
-    break
+  if readyz_ok; then
+    streak=$((streak+1))
+    echo "readyz ok (${streak}/${READY_STREAK_REQUIRED})"
+    [[ $streak -ge $READY_STREAK_REQUIRED ]] && break
+  else
+    streak=0
   fi
-  sleep "${SLEEP_STEP}"
+  sleep "$SLEEP_STEP"
 done
+[[ $streak -ge $READY_STREAK_REQUIRED ]] || { debug_dump; [[ "$AUTO_ROLLBACK" == "1" ]] && rollback "$BACKUP"; die "apiserver not stable ready"; }
 
-if ! curl -sk https://127.0.0.1:6443/readyz >/dev/null 2>&1; then
-  echo "ERROR: apiserver not ready within ${WAIT_SEC}s." >&2
-  echo "Rollback to backup: ${BACKUP}" >&2
-  cp -a "${BACKUP}" "${APISERVER_MANIFEST}"
-  sleep 15
+echo "[7/10] Generate events"
+NS="audit-log-test-$(date +%s)"
+kubectl create ns "$NS" >/dev/null
+kubectl delete ns "$NS" --wait=false >/dev/null
+
+echo "[8/10] Wait ${TEST_WAIT_AFTER_EVENTS}s for audit flush"
+sleep "$TEST_WAIT_AFTER_EVENTS"
+
+echo "[9/10] Verify audit log contains namespace token"
+if ! tail -n "$GREP_LINES" "$AUDIT_LOG_FILE" | grep -q "$NS"; then
+  echo "VERIFY FAIL: audit.log doesn't contain $NS"
+  debug_dump
+  [[ "$AUTO_ROLLBACK" == "1" ]] && rollback "$BACKUP"
   exit 2
 fi
 
-# ========= VERIFY =========
-echo "[7/9] Verify audit flags in manifest"
-grep -nE -- '--audit-policy-file=|--audit-log-path=|--audit-log-maxage=|--audit-log-maxbackup=|--audit-log-maxsize=' \
-  "${APISERVER_MANIFEST}" || true
-
-echo "[8/9] Smoke test: generate audit events"
-if command -v kubectl >/dev/null 2>&1; then
-  NS="audit-log-test-$(date +%s)"
-  kubectl create ns "${NS}" >/dev/null
-  kubectl delete ns "${NS}" --wait=false >/dev/null
-  sleep 2
-  echo "Audit log lines for ${NS}:"
-  tail -n 800 "${AUDIT_LOG_FILE}" | grep -E "\"name\":\"${NS}\"|\"namespace\":\"${NS}\"|${NS}" | tail -n 50 || true
-else
-  echo "kubectl not found, skipping kubectl smoke test."
-  echo "Manual test:"
-  echo "  NS=audit-log-test-\$(date +%s); kubectl create ns \$NS; kubectl delete ns \$NS --wait=false"
-  echo "  sudo tail -n 800 ${AUDIT_LOG_FILE} | grep \$NS"
-fi
-
-echo "[9/9] Done. Audit log path: ${AUDIT_LOG_FILE}"
+echo "[10/10] OK: audit logging enabled and verified."
+echo "Audit log: $AUDIT_LOG_FILE"
+tail -n "$GREP_LINES" "$AUDIT_LOG_FILE" | grep "$NS" | tail -n 5 || true
